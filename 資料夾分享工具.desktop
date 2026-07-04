@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=資料夾分享工具
+Name[en]=Folder Share Tool
+Comment=把資料夾打包成文字或還原（圖形介面）
+Comment[en]=Pack a folder into text or restore it (GUI)
+# %k = 本 .desktop 檔自身的位置，藉此自動定位同資料夾內的啟動腳本，免手動填路徑
+Exec=bash -c 'D="$(dirname "$(echo %k | sed -e "s,^file://,," -e "s,%%20, ,g")")"; "$D/資料夾分享工具.sh"'
+Icon=folder
+Terminal=false
+Categories=Utility;

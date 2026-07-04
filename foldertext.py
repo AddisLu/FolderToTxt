@@ -307,15 +307,18 @@ def _clipboard_set(text):
             except OSError:
                 pass
         return
-    # Linux / 其他：試 xclip -> xsel
-    for cmd in (["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]):
+    # Linux / 其他：Wayland 的 wl-copy -> X11 的 xclip -> xsel
+    for cmd in (["wl-copy"], ["xclip", "-selection", "clipboard"],
+                ["xsel", "--clipboard", "--input"]):
         try:
             p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
             p.communicate(text.encode("utf-8"))
-            return
+            if p.returncode == 0:
+                return
         except OSError:
             continue
-    raise RuntimeError("找不到可用的剪貼簿工具（請安裝 xclip 或 xsel）。")
+    raise RuntimeError(
+        "找不到可用的剪貼簿工具（請安裝 wl-clipboard、xclip 或 xsel 其中之一）。")
 
 
 def _clipboard_get():
@@ -328,10 +331,11 @@ def _clipboard_get():
             "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-Clipboard -Raw",
         ])
         return out.decode("utf-8")
-    for cmd in (["xclip", "-selection", "clipboard", "-o"], ["xsel", "--clipboard", "--output"]):
+    for cmd in (["wl-paste", "--no-newline"], ["xclip", "-selection", "clipboard", "-o"],
+                ["xsel", "--clipboard", "--output"]):
         try:
-            return subprocess.check_output(cmd).decode("utf-8")
-        except OSError:
+            return subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode("utf-8")
+        except (OSError, subprocess.CalledProcessError):
             continue
     return ""
 
@@ -506,9 +510,14 @@ def _run_gui_tk():
 
         if act == "unpack":
             try:
-                content = root.clipboard_get()
+                content = _clipboard_get()  # 原生工具（含 Wayland wl-paste）
             except Exception:
                 content = ""
+            if MAGIC not in content:
+                try:
+                    content = root.clipboard_get()  # 後備：tkinter 剪貼簿
+                except Exception:
+                    pass
             if MAGIC not in content:
                 if messagebox.askyesno(
                     "找不到內容",
