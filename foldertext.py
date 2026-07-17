@@ -34,6 +34,7 @@ import base64
 import gzip
 import hashlib
 import os
+import re
 import sys
 
 MAGIC = "FOLDERTEXT v1"          # 內層純文字格式（肉眼可讀）
@@ -180,14 +181,15 @@ def _compress(text, root_name):
     return "\n".join(lines) + "\n"
 
 
-def _decompress(content):
+def _decompress(content, warnings=None):
     """把 gzip+base64 塊還原成 v1 純文字。對平台竄改的失敗會明確報錯，
-    不會像長度前綴格式那樣默默錯位。"""
+    不會像長度前綴格式那樣默默錯位。warnings（list）用來回報非致命問題。"""
     idx = content.find(MAGIC2)
     body = content[idx + len(MAGIC2):]
 
     expected_sha = None
     b64_parts = []
+    b64_line = re.compile(r"^[A-Za-z0-9+/=]+$")
     for line in body.splitlines():
         s = line.strip()
         if not s:
@@ -196,11 +198,13 @@ def _decompress(content):
             if s.startswith("# sha256:"):
                 expected_sha = s.split(":", 1)[1].strip()
             continue
-        b64_parts.append(s)
+        if b64_line.match(s):
+            b64_parts.append(s)
+        elif b64_parts:
+            break  # base64 區塊已結束，後面是貼上時多帶到的雜訊
 
     b64 = "".join(b64_parts)
     try:
-        # validate=False：自動丟棄非 base64 字元（多餘空白等），更耐平台竄改
         gz = base64.b64decode(b64)
         raw = gzip.decompress(gz)
     except Exception as e:
@@ -209,7 +213,10 @@ def _decompress(content):
         )
 
     if expected_sha is not None and _sha256_bytes(raw) != expected_sha:
-        sys.stderr.write("警告：解壓後 sha256 不符，內容可能不完整。\n")
+        msg = "解壓後 sha256 不符，內容可能不完整。"
+        sys.stderr.write("警告：%s\n" % msg)
+        if warnings is not None:
+            warnings.append(msg)
 
     return raw.decode("utf-8")
 
@@ -220,10 +227,18 @@ def _looks_packed(content):
 
 
 def unpack(content, out_dir):
-    """把整串文字還原成資料夾（寫到 out_dir 底下）。新舊格式皆可自動辨識。"""
+    """把整串文字還原成資料夾（寫到 out_dir 底下）。新舊格式皆可自動辨識。
+
+    回傳警告訊息 list（已同步印到 stderr；GUI 模式靠它把問題顯示給使用者）。"""
+    warnings = []
+
+    def _warn(msg):
+        warnings.append(msg)
+        sys.stderr.write("警告：%s\n" % msg)
+
     # 新格式：先把 gzip+base64 塊解回 v1 純文字
     if MAGIC2 in content:
-        content = _decompress(content)
+        content = _decompress(content, warnings)
 
     if MAGIC not in content:
         raise SystemExit("錯誤：找不到 '%s' 標頭，這不是有效的打包文字。" % MAGIC)
@@ -284,20 +299,28 @@ def unpack(content, out_dir):
 
         actual = _sha256_bytes(data)
         if actual != digest:
-            sys.stderr.write(
-                "警告：%s 摘要不符（內容可能在傳輸中被更動）。\n" % rel_path
-            )
-
-        target = _safe_join(out_dir, rel_path)
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        with open(target, "wb") as fh:
-            fh.write(data)
-        file_count += 1
+            _warn("%s 摘要不符（內容可能在傳輸中被更動）。" % rel_path)
 
         pos = payload_start + length
 
+        target = _safe_join(out_dir, rel_path)
+        # 個別檔案寫不出來（如檔名含 Windows 不允許的字元）只警告、不中斷，
+        # 其餘檔案照常還原。
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "wb") as fh:
+                fh.write(data)
+        except OSError as e:
+            _warn("無法寫出 %s（%s）。" % (rel_path, e))
+            continue
+        file_count += 1
+
+    if file_count == 0 and dir_count == 0:
+        _warn("內容裡沒有任何檔案或資料夾（打包文字可能不完整）。")
+
     sys.stderr.write("已還原 %d 個檔案、%d 個資料夾 -> %s\n"
                      % (file_count, dir_count, out_dir))
+    return warnings
 
 
 def _safe_join(base, rel):
@@ -515,9 +538,17 @@ def _run_gui_macos():
                 root_name = line.split(":", 1)[1].strip() or root_name
                 break
         out_dir = os.path.join(dest.rstrip("/"), root_name)
-        unpack(content, out_dir)
+        try:
+            warns = unpack(content, out_dir)
+        except (SystemExit, Exception) as e:
+            _gui_info("❌ 還原失敗：\n%s" % e)
+            return 1
         subprocess.Popen(["open", out_dir])  # 在 Finder 打開結果
-        _gui_info("✅ 還原完成！已在 Finder 打開：\n%s" % out_dir)
+        if warns:
+            _gui_info("⚠️ 還原完成，但有 %d 個警告（部分內容可能不完整）：\n%s"
+                      % (len(warns), "\n".join("• %s" % w for w in warns[:10])))
+        else:
+            _gui_info("✅ 還原完成！已在 Finder 打開：\n%s" % out_dir)
         return 0
 
     return 0
@@ -627,9 +658,22 @@ def _run_gui_tk():
                     root_name = line.split(":", 1)[1].strip() or root_name
                     break
             out_dir = os.path.join(dest.rstrip("/\\"), root_name)
-            unpack(content, out_dir)
+            try:
+                warns = unpack(content, out_dir)
+            except (SystemExit, Exception) as e:
+                messagebox.showerror("還原失敗", "%s" % e)
+                return 1
             _open_in_file_manager(out_dir)
-            messagebox.showinfo("完成", "✅ 還原完成！\n%s" % out_dir)
+            if warns:
+                messagebox.showwarning(
+                    "還原完成（有 %d 個警告）" % len(warns),
+                    "還原到：%s\n\n部分內容可能不完整：\n\n%s"
+                    % (out_dir, "\n".join("• %s" % w for w in warns[:15])
+                       + ("\n…（其餘 %d 個略）" % (len(warns) - 15)
+                          if len(warns) > 15 else "")),
+                )
+            else:
+                messagebox.showinfo("完成", "✅ 還原完成！\n%s" % out_dir)
             return 0
 
         return 0
